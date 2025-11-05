@@ -10,11 +10,40 @@ import AuthenticationServices
 import GoogleSignIn
 import FirebaseAuth
 import Combine
+import os.log
 
 extension Notification.Name {
     static let authStateDidChange = Notification.Name("authStateDidChange")
 }
 import CryptoKit
+
+// MARK: - Authentication Errors
+
+enum AuthenticationError: LocalizedError {
+    case nonceGenerationFailed(OSStatus)
+    case credentialError(String)
+    case signInCancelled
+    case unknownError
+    case invalidAppleCredentials
+    case invalidGoogleCredentials
+
+    var errorDescription: String? {
+        switch self {
+        case .nonceGenerationFailed(let status):
+            return "Failed to generate secure nonce. SecRandomCopyBytes error: \(status)"
+        case .credentialError(let message):
+            return "Credential error: \(message)"
+        case .signInCancelled:
+            return "Sign in was cancelled"
+        case .unknownError:
+            return "An unknown authentication error occurred"
+        case .invalidAppleCredentials:
+            return "Invalid Apple Sign In credentials received"
+        case .invalidGoogleCredentials:
+            return "Invalid Google Sign In credentials received"
+        }
+    }
+}
 
 // MARK: - Authentication Service Protocol
 
@@ -22,7 +51,7 @@ import CryptoKit
 protocol AuthenticationServiceProtocol {
     var isAuthenticated: Bool { get }
     var currentUser: User? { get }
-    
+
     func signInWithApple() async throws -> User
     func signInWithGoogle() async throws -> User
     func signOut() async throws
@@ -43,10 +72,11 @@ class AuthenticationService: NSObject, @preconcurrency AuthenticationServiceProt
     @Published var isGuestMode: Bool = false
     
     // MARK: - Private Properties
-    
+
     private let firebaseService: FirebaseServiceProtocol
     private let userViewModel: UserViewModel
-    
+    private let logger = Logger(subsystem: "com.startsmart.mobile", category: "Authentication")
+
     private var cancellables = Set<AnyCancellable>()
     private var currentNonce: String?
     
@@ -61,7 +91,7 @@ class AuthenticationService: NSObject, @preconcurrency AuthenticationServiceProt
         let isGuest = UserDefaults.standard.bool(forKey: "is_guest_user")
         if isGuest {
             self.isGuestMode = true
-            print("✅ Guest mode detected from UserDefaults")
+            logger.debug("Guest mode detected from UserDefaults")
         }
         
         setupAuthenticationStateListener()
@@ -102,7 +132,7 @@ class AuthenticationService: NSObject, @preconcurrency AuthenticationServiceProt
                 currentUser = try await firebaseService.loadUserProfile(userId: firebaseUser.uid)
                 authenticationState = .signedIn
             } catch {
-                print("Failed to load user profile: \(error)")
+                logger.error("Failed to load user profile: \(error.localizedDescription, privacy: .public)")
                 authenticationState = .error(error)
             }
         } else {
@@ -115,9 +145,9 @@ class AuthenticationService: NSObject, @preconcurrency AuthenticationServiceProt
     
     func signInWithApple() async throws -> User {
         authenticationState = .signingIn
-        
+
         do {
-            let nonce = randomNonceString()
+            let nonce = try randomNonceString()
             currentNonce = nonce
             
             let appleIDCredential = try await requestAppleAuthorization(nonce: sha256(nonce))
@@ -320,35 +350,37 @@ class AuthenticationService: NSObject, @preconcurrency AuthenticationServiceProt
     }
     
     // MARK: - Apple Sign In Helpers
-    
-    private func randomNonceString(length: Int = 32) -> String {
+
+    private func randomNonceString(length: Int = 32) throws -> String {
         precondition(length > 0)
         let charset: [Character] = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._")
         var result = ""
         var remainingLength = length
-        
+
         while remainingLength > 0 {
-            let randoms: [UInt8] = (0..<16).map { _ in
+            var randoms: [UInt8] = []
+            for _ in 0..<16 {
                 var random: UInt8 = 0
                 let errorCode = SecRandomCopyBytes(kSecRandomDefault, 1, &random)
                 if errorCode != errSecSuccess {
-                    fatalError("Unable to generate nonce. SecRandomCopyBytes failed with OSStatus \(errorCode)")
+                    logger.error("Failed to generate secure random bytes. OSStatus: \(errorCode)")
+                    throw AuthenticationError.nonceGenerationFailed(errorCode)
                 }
-                return random
+                randoms.append(random)
             }
-            
+
             randoms.forEach { random in
                 if remainingLength == 0 {
                     return
                 }
-                
+
                 if random < charset.count {
                     result.append(charset[Int(random)])
                     remainingLength -= 1
                 }
             }
         }
-        
+
         return result
     }
     

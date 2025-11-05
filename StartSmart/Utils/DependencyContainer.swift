@@ -1,14 +1,21 @@
 import Foundation
 import Combine
+import os.log
 
 // MARK: - Dependency Container Errors
 enum DependencyContainerError: Error, LocalizedError {
     case initializationFailed
-    
+    case dependencyNotRegistered(String)
+    case dependencyAccessedBeforeInitialization(String)
+
     var errorDescription: String? {
         switch self {
         case .initializationFailed:
             return "Failed to initialize application dependencies"
+        case .dependencyNotRegistered(let key):
+            return "Dependency '\(key)' not registered in container"
+        case .dependencyAccessedBeforeInitialization(let key):
+            return "Dependency '\(key)' accessed before container initialization"
         }
     }
 }
@@ -40,9 +47,10 @@ protocol DependencyContainerProtocol {
 /// - Stage 2: Heavy services loaded in background
 class DependencyContainer: DependencyContainerProtocol, ObservableObject {
     static let shared = DependencyContainer()
-    
+
     private var dependencies: [String: Any] = [:]
     private let queue = DispatchQueue(label: "dependency.container", attributes: .concurrent)
+    private let logger = Logger(subsystem: "com.startsmart.mobile", category: "DependencyContainer")
     
     // ✅ Two-stage initialization
     @Published var isInitialized = false        // Essential services (UI can proceed)
@@ -100,24 +108,29 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
     
     func resolve<T>() -> T {
         let key = String(describing: T.self)
-        
-        let dependency = queue.sync { 
-            return dependencies[key] as? T 
+
+        let dependency = queue.sync {
+            return dependencies[key] as? T
         }
-        
+
         if let dependency = dependency {
             return dependency
         }
-        
+
         // Check initialization status
-        let initialized = initializationQueue.sync { 
-            return isInitialized 
+        let initialized = initializationQueue.sync {
+            return isInitialized
         }
-        
+
         if !initialized {
-            fatalError("Dependency \(key) requested before container initialized")
+            logger.critical("Dependency \(key, privacy: .public) requested before container initialized. This indicates a programming error.")
+            // In production, this is a critical error that should crash the app
+            // to prevent undefined behavior, but we log it first for debugging
+            preconditionFailure("Dependency \(key) requested before container initialized")
         }
-        fatalError("Dependency \(key) not registered")
+
+        logger.critical("Dependency \(key, privacy: .public) not registered in container. This indicates a programming error.")
+        preconditionFailure("Dependency \(key) not registered")
     }
 
     // ✅ FIXED: Safe resolve that waits for full initialization
@@ -139,8 +152,8 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
         if isFullyInitialized {
             return queue.sync(execute: { self.dependencies[key] as? T })
         }
-        
-        print("⚠️ WARNING: resolveSafe timed out waiting for \(key) initialization")
+
+        logger.warning("resolveSafe timed out waiting for \(key, privacy: .public) initialization after 30 seconds")
         return nil
     }
 
@@ -176,7 +189,7 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
         }
         
         // Timeout occurred
-        print("❌ ERROR: Timeout waiting for dependency \(key) - initialization took >30s")
+        logger.error("Timeout waiting for dependency \(key, privacy: .public) - initialization took >30 seconds")
         throw DependencyContainerError.initializationFailed
     }
     
@@ -184,18 +197,18 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
     @MainActor
     private func setupDefaultDependencies() async {
         let startTime = Date()
-        print("⚡ FAST STARTUP: Stage 1 - Essential Services Only")
-        
+        logger.info("Starting Stage 1 initialization - Essential Services")
+
         var firebaseService: FirebaseServiceProtocol!
-        
+
         // ========== STAGE 1: ESSENTIAL SERVICES (Fast) ==========
         // These are needed for UI to function
-        
+
         // 1. Firebase (needed for auth)
         do {
             firebaseService = FirebaseService()
             register(firebaseService, for: FirebaseServiceProtocol.self)
-            print("✅ FirebaseService ready")
+            logger.debug("FirebaseService initialized")
         }
         
         // 2. Authentication (needed for login/signup)
@@ -204,36 +217,36 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
             let authService = AuthenticationService(firebaseService: firebaseService, userViewModel: userViewModel)
             register(authService, for: AuthenticationServiceProtocol.self)
             register(userViewModel, for: UserViewModel.self)
-            print("✅ AuthenticationService ready")
+            logger.debug("AuthenticationService initialized")
         }
-        
+
         // 3. Storage (needed for user preferences)
         do {
             let localStorage = UserDefaultsStorage()
             register(localStorage, for: LocalStorageProtocol.self)
-            print("✅ Storage ready")
+            logger.debug("Storage initialized")
         }
-        
+
         // 4. Subscriptions (needed for paywall)
         do {
             let subscriptionService = SubscriptionService()
             register(subscriptionService, for: SubscriptionServiceProtocol.self)
-            
+
             let localStorage: LocalStorageProtocol = resolve()
             let subscriptionManager = SubscriptionManager(
                 subscriptionService: subscriptionService,
                 localStorage: localStorage
             )
             register(subscriptionManager, for: SubscriptionManagerProtocol.self)
-            print("✅ Subscription services ready")
+            logger.debug("Subscription services initialized")
         }
-        
+
         // 5. Alarms (using AlarmKit for reliable alarm functionality)
         do {
             let alarmRepository = AlarmRepository()
             register(alarmRepository, for: AlarmRepositoryProtocol.self)
-            
-            print("✅ Alarm services ready (AlarmKit)")
+
+            logger.debug("Alarm services initialized (AlarmKit)")
         }
         
         // ✅ MARK STAGE 1 COMPLETE - UI CAN PROCEED
@@ -242,13 +255,13 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
             self.isInitialized = true
             self.isInitializing = false
         }
-        
+
         DispatchQueue.main.async {
             self.objectWillChange.send()
         }
-        
-        print("⚡ STAGE 1 COMPLETE in \(Int(stage1Time * 1000))ms - UI READY")
-        print("🔄 Starting Stage 2 in background...")
+
+        logger.info("Stage 1 complete in \(Int(stage1Time * 1000))ms - UI ready")
+        logger.debug("Starting Stage 2 initialization in background")
         
         // ========== STAGE 2: HEAVY SERVICES (Background) ==========
         // These load while user interacts with UI
@@ -266,16 +279,18 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
             await self.initializeGamificationServices()
             
             let stage2Time = Date().timeIntervalSince(stage2Start)
-            
+
             // ✅ FIXED: Mark fully initialized on main thread
             await MainActor.run {
                 self.isFullyInitialized = true
                 self.objectWillChange.send()
             }
-            
+
             let totalTime = Date().timeIntervalSince(startTime)
-            print("✅ STAGE 2 COMPLETE in \(Int(stage2Time * 1000))ms")
-            print("🎉 ALL SERVICES LOADED - Total time: \(Int(totalTime * 1000))ms")
+            await MainActor.run {
+                self.logger.info("Stage 2 complete in \(Int(stage2Time * 1000))ms")
+                self.logger.info("All services loaded - Total time: \(Int(totalTime * 1000))ms")
+            }
         }
     }
     
@@ -285,17 +300,17 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
         do {
             let grok4Service = Grok4Service(apiKey: ServiceConfiguration.APIKeys.grok4)
             register(grok4Service, for: Grok4ServiceProtocol.self)
-            
+
             let elevenLabsService = ElevenLabsService(apiKey: ServiceConfiguration.APIKeys.elevenLabs)
             register(elevenLabsService, for: ElevenLabsServiceProtocol.self)
-            
+
             let contentService = ContentGenerationService(
                     aiService: grok4Service,
                     ttsService: elevenLabsService
                 )
             register(contentService, for: ContentGenerationServiceProtocol.self)
-            
-            print("✅ AI services ready")
+
+            logger.debug("AI services initialized")
         }
     }
     
@@ -326,25 +341,25 @@ class DependencyContainer: DependencyContainerProtocol, ObservableObject {
             
             let speechRecognitionService = SpeechRecognitionService()
             register(speechRecognitionService, for: SpeechRecognitionServiceProtocol.self)
-            
-            print("✅ Audio services ready")
+
+            logger.debug("Audio services initialized")
         } catch {
-            print("❌ ERROR: Audio Services - \(error)")
+            logger.error("Failed to initialize audio services: \(error.localizedDescription, privacy: .public)")
         }
     }
-    
+
     @MainActor
     private func initializeGamificationServices() async {
         do {
             let localStorage: LocalStorageProtocol = resolve()
-            
+
             let streakTrackingService = StreakTrackingService(storage: localStorage)
             register(streakTrackingService, for: StreakTrackingServiceProtocol.self)
-            
+
             let socialSharingService = SocialSharingService(storage: localStorage)
             register(socialSharingService, for: SocialSharingServiceProtocol.self)
-            
-            print("✅ Gamification services ready")
+
+            logger.debug("Gamification services initialized")
         }
     }
 }

@@ -180,11 +180,12 @@ struct StartSmartApp: App {
         guard let path = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
               let plist = NSDictionary(contentsOfFile: path),
               let clientId = plist["CLIENT_ID"] as? String else {
-            print("Warning: GoogleService-Info.plist not found or CLIENT_ID missing")
+            Self.logger.warning("GoogleService-Info.plist not found or CLIENT_ID missing - Google Sign In will not be available")
             return
         }
-        
+
         GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: clientId)
+        Self.logger.debug("Google Sign In configured successfully")
     }
 }
 

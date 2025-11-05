@@ -11,6 +11,7 @@ import FirebaseFirestore
 import FirebaseStorage
 import FirebaseCore
 import Combine
+import os.log
 
 // MARK: - Firebase Configuration Protocol
 
@@ -51,11 +52,12 @@ class FirebaseService: @preconcurrency FirebaseServiceProtocol, ObservableObject
     @Published var currentUser: User?
     
     // MARK: - Private Properties
-    
+
     private let auth = Auth.auth()
     private let firestore = Firestore.firestore()
     private let storage = Storage.storage()
-    
+    private let logger = Logger(subsystem: "com.startsmart.mobile", category: "Firebase")
+
     private var authStateListenerHandle: AuthStateDidChangeListenerHandle?
     private var cancellables = Set<AnyCancellable>()
     
@@ -83,7 +85,7 @@ class FirebaseService: @preconcurrency FirebaseServiceProtocol, ObservableObject
                     do {
                         self?.currentUser = try await self?.loadUserProfile(userId: firebaseUser.uid)
                     } catch {
-                        print("Failed to load user profile: \(error)")
+                        self?.logger.error("Failed to load user profile: \(error.localizedDescription, privacy: .public)")
                     }
                 } else {
                     self?.currentUser = nil
@@ -254,15 +256,19 @@ class FirebaseService: @preconcurrency FirebaseServiceProtocol, ObservableObject
 
 /// Firebase configuration manager
 class FirebaseConfiguration {
-    
+    private static let logger = Logger(subsystem: "com.startsmart.mobile", category: "FirebaseConfig")
+
     /// Configure Firebase with GoogleService-Info.plist
     static func configure() {
         guard let path = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
               let _ = NSDictionary(contentsOfFile: path) else {
-            fatalError("GoogleService-Info.plist not found. Please add it to the Resources folder.")
+            logger.critical("GoogleService-Info.plist not found. Firebase cannot be configured. Please add it to the Resources folder.")
+            // This is a critical configuration error - the app cannot function without Firebase
+            preconditionFailure("GoogleService-Info.plist not found. Please add it to the Resources folder.")
         }
-        
+
         FirebaseApp.configure()
+        logger.info("Firebase configured successfully")
     }
 }
 
